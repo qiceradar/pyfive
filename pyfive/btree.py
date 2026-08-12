@@ -7,7 +7,6 @@ import numpy as np
 
 from .core import _unpack_struct_from_file
 from .core import _unpack_struct_from
-from .core import _unpack_integer
 
 
 class AbstractBTree(object):
@@ -541,46 +540,19 @@ class BTreeV2AttrNames(BTreeV2):
         return _unpack_struct_from(V2_BTREE_NODE_TYPE_8_LAYOUT, record)
 
 
-class BTreeV2HugeObjectsIndirect(BTreeV2):
+class BTreeV2HugeObjects(BTreeV2):
     """
-    HDF5 version 2 B-Tree storing indirectly accessed, non-filtered huge objects.
+    HDF5 version 2 B-Tree storing huge objects (type 1).
 
-    Record layout (type 1):
-    - huge object address
-    - huge object length
-    - huge object ID (lookup key)
+    Records contain the address, length, and ID of each huge object
+    stored outside the fractal heap's managed blocks.
     """
 
     NODE_TYPE = 1  # type: ignore[assignment]
 
-    def __init__(self, fh, offset, sizeof_offsets, sizeof_lengths):
-        self._sizeof_offsets = sizeof_offsets
-        self._sizeof_lengths = sizeof_lengths
-        self.record_by_id = {}
-        super().__init__(fh, offset)
-
     def _parse_record(self, record):
-        rec_offset = _unpack_integer(self._sizeof_offsets, record, 0)
-        rec_length = _unpack_integer(self._sizeof_lengths, record, self._sizeof_offsets)
-        rec_id = _unpack_integer(
-            self._sizeof_lengths,
-            record,
-            self._sizeof_offsets + self._sizeof_lengths,
-        )
-        return {"address": rec_offset, "length": rec_length, "id": rec_id}
-
-    def find(self, huge_object_id):
-        """Return the record matching a huge-object ID/key."""
-        # read the b-tree and cache.
-        if self.record_by_id == {}:
-            for record in self.iter_records():
-                self.record_by_id[record["id"]] = record
-        try:
-            return self.record_by_id[huge_object_id]
-        except KeyError as e:
-            raise KeyError(
-                f"Huge object ID not found in v2 B-tree: {huge_object_id}"
-            ) from e
+        address, length, obj_id = struct.unpack_from("<QQQ", record)
+        return {"address": address, "length": length, "id": obj_id}
 
 
 # IV.A.2.l The Data Storage - Filter Pipeline message

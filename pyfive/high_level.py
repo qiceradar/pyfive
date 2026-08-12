@@ -6,7 +6,6 @@ from collections.abc import Callable
 from collections.abc import Mapping, Sequence
 from abc import ABC
 import os
-import warnings
 import posixpath
 import warnings
 import logging
@@ -15,12 +14,51 @@ from typing import Any, BinaryIO, cast
 from typing_extensions import Self  # Python 3.10-compat
 from pyfive.core import Reference
 from pyfive.dataobjects import DataObjects, DatasetID
-from pyfive.misc_low_level import SuperBlock
+from pyfive.misc_low_level import SuperBlock, _find_superblock_offset
 from pyfive.h5py import Datatype
 from pyfive.p5t import P5VlenStringType, P5ReferenceType, P5SequenceType
 from pyfive.utilities import MetadataBufferingWrapper
 
 logger = logging.getLogger(__name__)
+
+
+class _OffsetFileWrapper:
+    """
+    Wraps a file handle to apply a base offset to all absolute seeks.
+
+    HDF5 files may have a user block before the superblock (e.g. MATLAB v7.3
+    .mat files have a 512-byte MATLAB header). Per the HDF5 spec, all
+    addresses stored in the file are relative to the superblock's base_address.
+    This wrapper shifts the coordinate system so that position 0 corresponds
+    to the base_address in the underlying file, allowing pyfive to use stored
+    addresses directly without adjustment.
+    """
+
+    def __init__(self, fh, offset):
+        self._fh = fh
+        self._offset = offset
+
+    def seek(self, pos, whence=0):
+        if whence == 0:  # SEEK_SET
+            return self._fh.seek(pos + self._offset, 0)
+        return self._fh.seek(pos, whence)
+
+    def read(self, *args):
+        return self._fh.read(*args)
+
+    def tell(self):
+        return self._fh.tell() - self._offset
+
+    def close(self):
+        return self._fh.close()
+
+    @property
+    def closed(self):
+        return getattr(self._fh, "closed", False)
+
+    @property
+    def name(self):
+        return getattr(self._fh, "name", None)
 
 
 class Group(Mapping):
@@ -298,6 +336,9 @@ class File(Group):
             # str | BytesIO = MetadataBufferingWrapper
             self._fh = fh
 
+        superblock_offset = _find_superblock_offset(self._fh)
+        if superblock_offset > 0:
+            self._fh = _OffsetFileWrapper(self._fh, superblock_offset)
         self._superblock = SuperBlock(self._fh, 0)
         self._dataobjects_cache: dict = {}
         offset = self._superblock.offset_to_dataobjects
@@ -305,7 +346,7 @@ class File(Group):
 
         self.file = self
         self.mode = "r"
-        self.userblock_size = 0
+        self.userblock_size = superblock_offset
         super(File, self).__init__("/", dataobjects, self)
 
     @property
@@ -602,8 +643,8 @@ class DimensionManager(Sequence):
         if "DIMENSION_LABELS" in dset.attrs:
             dim_labels = dset.attrs["DIMENSION_LABELS"]
         self._dims = [
-            DimensionProxy(dset, dset.file, label, refs, axis)
-            for axis, (label, refs) in enumerate(zip(dim_labels, dim_list))
+            DimensionProxy(dset.file, label, refs)
+            for label, refs in zip(dim_labels, dim_list)
         ]
 
     def __len__(self):
@@ -616,7 +657,7 @@ class DimensionManager(Sequence):
 class DimensionProxy(Sequence):
     """Represents a HDF5 "dimension"."""
 
-    def __init__(self, dset, dset_file, label, refs, axis):
+    def __init__(self, dset_file, label, refs):
         try:
             # decode a byte string
             label = label.decode("utf-8")
@@ -624,65 +665,15 @@ class DimensionProxy(Sequence):
             # str doesn't have a decode method
             pass
 
-        self._dset = dset
         self.label = label
         self._refs = refs
         self._file = dset_file
-        self._axis = axis
 
     def __len__(self):
         return len(self._refs)
 
     def __getitem__(self, x):
-        dscale = self._file[self._refs[x]]
-        dscale_shape = dscale.shape
-        dset_shape = self._dset.shape
-
-        # If a dimension scale size does not match this dataset axis size,
-        # present an alias (for example time_counter_1) to expose corruption.
-        if dscale_shape and self._axis < len(dset_shape):
-            axis_size = dset_shape[self._axis]
-            scale_size = dscale_shape[0]
-            if axis_size != scale_size:
-                alias_name = _append_dimension_suffix(dscale.name, scale_size)
-                warnings.warn(
-                    (
-                        f"Dimension scale '{os.path.basename(dscale.name)}' has size {scale_size}, "
-                        f"but dataset '{os.path.basename(self._dset.name)}' axis {self._axis} "
-                        f"has size {axis_size}. Using alias '{os.path.basename(alias_name)}'."
-                    ),
-                    UserWarning,
-                    stacklevel=2,
-                )
-                return _AliasedDimensionScale(dscale, alias_name)
-
-        return dscale
-
-
-def _append_dimension_suffix(path, suffix):
-    """Append a suffix to the final component of an HDF5 path."""
-    if "/" in path:
-        prefix, base = path.rsplit("/", 1)
-        return f"{prefix}/{base}_{suffix}"
-    return f"{path}_{suffix}"
-
-
-class _AliasedDimensionScale:
-    """Proxy around a dimension scale dataset with an aliased name."""
-
-    def __init__(self, dset, alias_name):
-        self._dset = dset
-        self.name = alias_name
-
-    def __repr__(self):
-        info = (os.path.basename(self.name), self.shape, self.dtype)
-        return '<HDF5 dataset "%s": shape %s, type "%s">' % info
-
-    def __getitem__(self, args):
-        return self._dset[args]
-
-    def __getattr__(self, attr):
-        return getattr(self._dset, attr)
+        return self._file[self._refs[x]]
 
 
 class AstypeContext(object):
